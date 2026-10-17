@@ -2,7 +2,7 @@
 Script to allow sorting by popularity
 
 
-Pixv doesn't allow sorting by popularity so this script can do that function.
+Pixiv doesn't allow sorting by popularity so this script can do that function.
 
 Installation
 - Install the Tampermonkey extension if you don’t have it.
