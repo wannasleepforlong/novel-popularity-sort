@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Pixiv Novel Tag — Sort by Popularity (free)
+// @name         Pixiv Novel Tag - Sort by Popularity (free)
 // @namespace    https://github.com/local/pixiv-novel-popsort
-// @version      1.2.0
-// @description  Adds a "Sort by popularity" button on Pixiv novel tag/search pages. Fetches results via the site's own AJAX API and re-sorts by bookmark count client-side — no Premium required.
+// @version      1.3.1
+// @description  Adds a "Sort by popularity" button on Pixiv novel tag/search pages. Fetches results via the site's own AJAX API and re-sorts by bookmark count client-side. No Premium required.
 // @author       you
 // @match        https://www.pixiv.net/*
 // @run-at       document-idle
@@ -48,44 +48,82 @@
   `;
 
   const NOVEL_URL = id => `https://www.pixiv.net/novel/show.php?id=${id}`;
+  const SERIES_URL = id => `https://www.pixiv.net/novel/series/${id}`;
 
-  function isNovelSearchPage() {
-    // matches /tags/<tag>/novels  (with optional /en or other lang prefix)
-    return /\/tags\/[^/]+\/novels/.test(location.pathname);
+  // With gs=1 (group by series) the API returns series objects: `id` is the
+  // series ID, and one-shots carry the real novel ID in `novelId`.
+  function itemUrl(n) {
+    if (n.isOneshot === false) return SERIES_URL(n.id);
+    return NOVEL_URL(n.novelId || n.id);
   }
 
-  // Pull the tag out of the path, regardless of language prefix.
+  const TAG_PATH_RE = /\/tags\/([^/]+)\/novels/;
+  const SEARCH_PATH_RE = /^\/(?:[a-z]{2}(?:-[a-z]+)?\/)?search\/?$/;
+
+  function isNovelSearchPage() {
+    // old style: /tags/<tag>/novels (optional language prefix)
+    if (TAG_PATH_RE.test(location.pathname)) return true;
+    // new style: /search?q=...&type=novel
+    if (SEARCH_PATH_RE.test(location.pathname)) {
+      return new URLSearchParams(location.search).get('type') === 'novel';
+    }
+    return false;
+  }
+
+  // Search term: from the path on tag pages, from ?q= on the new search page.
   function currentTag() {
-    const m = location.pathname.match(/\/tags\/([^/]+)\/novels/);
-    return m ? decodeURIComponent(m[1]) : null;
+    const m = location.pathname.match(TAG_PATH_RE);
+    if (m) return decodeURIComponent(m[1]);
+    if (SEARCH_PATH_RE.test(location.pathname)) {
+      return new URLSearchParams(location.search).get('q');
+    }
+    return null;
   }
 
   function langPrefix() {
     const m = location.pathname.match(/^\/([a-z]{2})\//);
-    return m ? m[1] : 'en';
+    return m ? m[1] : (document.documentElement.lang || 'en').slice(0, 2);
   }
 
+  // The page URL uses s_mode values like tag, tag_full, tc, tag_tc.
+  // The AJAX API expects the s_-prefixed form.
+  function mapSMode(v) {
+    if (!v) return null;
+    return v.startsWith('s_') ? v : 's_' + v;
+  }
+
+  let sModeOverride = null; // set if the API rejects the mapped mode
+
   // Build the AJAX query, carrying over the filters already in the page URL
-  // (mode, s_mode, length filters, etc.) so the result set matches the page.
+  // so the result set matches what the page shows.
   function buildQuery(tag, page) {
     const enc = encodeURIComponent(tag);
     const cur = new URLSearchParams(location.search);
     const q = new URLSearchParams();
+    const SKIP = new Set(['q', 'p', 'type', 'r', 'word', 's_mode']);
+    for (const [k, v] of cur.entries()) if (!SKIP.has(k)) q.set(k, v);
     q.set('word', tag);
-    // carry over everything except the page number
-    for (const [k, v] of cur.entries()) if (k !== 'p') q.set(k, v);
-    if (!q.has('s_mode')) q.set('s_mode', 's_tag_full'); // tag-page default: exact tag
+    const isTagPage = TAG_PATH_RE.test(location.pathname);
+    q.set('s_mode', sModeOverride || mapSMode(cur.get('s_mode')) || (isTagPage ? 's_tag_full' : 's_tag'));
+    if (!q.has('mode')) q.set('mode', 'all');
     q.set('p', String(page));
     q.set('lang', langPrefix());
     return `/ajax/search/novels/${enc}?${q.toString()}`;
   }
 
-  async function fetchPage(tag, page) {
+  async function fetchPage(tag, page, retried = false) {
     const res = await fetch(buildQuery(tag, page), {
       credentials: 'same-origin',
       headers: { accept: 'application/json' },
     });
-    if (!res.ok) throw new Error(`HTTP ${res.status} on page ${page}`);
+    if (!res.ok) {
+      // An unknown s_mode can cause a 400. Fall back to plain tag search once.
+      if (res.status === 400 && !retried && sModeOverride !== 's_tag') {
+        sModeOverride = 's_tag';
+        return fetchPage(tag, page, true);
+      }
+      throw new Error(`HTTP ${res.status} on page ${page}`);
+    }
     const json = await res.json();
     if (json.error) throw new Error(json.message || 'Pixiv API error');
     const novel = json.body && json.body.novel;
@@ -96,7 +134,7 @@
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
   async function collectAll(tag, maxPages, onProgress) {
-    const HARD_CAP = 500; // safety ceiling so a huge tag can't loop forever
+    const HARD_CAP = 500; // safety ceiling so a huge tag cannot loop forever
     const first = await fetchPage(tag, 1);
     const pageSize = Math.max(1, first.data.length || 24);
     const totalPages = Math.min(maxPages, HARD_CAP, Math.ceil(first.total / pageSize) || 1);
@@ -154,7 +192,7 @@
         <button id="pnps-run">Scan &amp; sort</button>
         <button id="pnps-close" class="ghost">Close</button>
       </div>
-      <div id="pnps-status">Click “Scan &amp; sort”. Each page ≈ 24 novels; more pages = slower.</div>
+      <div id="pnps-status">Click "Scan &amp; sort". Each page is about 24 novels; more pages means slower.</div>
       <div id="pnps-list"></div>`;
     document.body.appendChild(panel);
 
@@ -171,22 +209,23 @@
 
     async function run() {
       const tag = currentTag();
-      if (!tag) { $('#pnps-status').textContent = 'Not on a novel tag page.'; return; }
+      if (!tag) { $('#pnps-status').textContent = 'Not on a novel tag or search page.'; return; }
       const all = $('#pnps-all').checked;
       const maxPages = all ? Infinity : Math.max(1, Math.min(50, parseInt($('#pnps-pages').value, 10) || 6));
       const list = $('#pnps-list');
       const status = $('#pnps-status');
       list.innerHTML = '';
+      sModeOverride = null;
       $('#pnps-run').disabled = true;
 
       try {
         const { list: novels, total } = await collectAll(
           tag, maxPages,
           (got, tot, p, pp) => {
-            status.textContent = `Fetched ${got} novels — page ${p}/${pp} (tag has ${tot} total)`;
+            status.textContent = `Fetched ${got} novels, page ${p}/${pp} (${tot} total)`;
           }
         );
-        status.textContent = `${novels.length} novels, sorted by bookmarks (of ${total} total in tag).`;
+        status.textContent = `${novels.length} novels, sorted by bookmarks (of ${total} total).`;
         render(list, novels);
       } catch (e) {
         status.textContent = 'Error: ' + e.message;
@@ -201,19 +240,22 @@
       novels.forEach((n, i) => {
         const row = document.createElement('div');
         row.className = 'pnps-row';
-        const thumb = n.url
-          ? `<img class="pnps-thumb" loading="lazy" src="${n.url}" onerror="this.style.visibility='hidden'">`
+        const img = n.url || n.cover;
+        const thumb = img
+          ? `<img class="pnps-thumb" loading="lazy" src="${img}" onerror="this.style.visibility='hidden'">`
           : `<div class="pnps-thumb"></div>`;
-        const chars = n.textCount ? ` · ${n.textCount.toLocaleString()} chars` : '';
+        const len = n.textCount || n.textLength;
+        const chars = len ? ` · ${len.toLocaleString()} chars` : '';
+        const eps = n.isOneshot === false && n.episodeCount ? ` · series, ${n.episodeCount} eps` : '';
         const tags = (n.tags || []).slice(0, 6).join(' / ');
         row.innerHTML = `
           <div class="pnps-rank">${i + 1}</div>
           ${thumb}
           <div class="pnps-body">
-            <a class="pnps-title" href="${NOVEL_URL(n.id)}" target="_blank" rel="noopener"></a>
+            <a class="pnps-title" href="${itemUrl(n)}" target="_blank" rel="noopener"></a>
             <div class="pnps-meta">
               <span class="pnps-bm">❤ ${(n.bookmarkCount || 0).toLocaleString()}</span>
-              · <span class="pnps-author"></span>${chars}
+              · <span class="pnps-author"></span>${chars}${eps}
             </div>
             <div class="pnps-tags"></div>
           </div>`;
@@ -238,7 +280,7 @@
     toggleFab();
   }
 
-  // Pixiv is a single-page app — watch for in-app navigation.
+  // Pixiv is a single-page app, so watch for in-app navigation.
   let lastHref = location.href;
   setInterval(() => {
     if (location.href !== lastHref) {
